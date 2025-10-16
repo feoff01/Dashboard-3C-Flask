@@ -1,10 +1,13 @@
-# app.py — Dashboard 3C+ (layout simplificado + "top hoje" nos gráficos)
-# Rodar:  pip install flask requests
-#         python app.py
+# app.py — Dashboard 3C+ com cache + coleta em background
+# Rodar local:  pip install flask requests
+#               python app.py
 
 from flask import Flask, jsonify, send_file, request, Response
 import requests, os, json
 from datetime import datetime, timedelta, timezone
+from threading import Thread, Lock
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 
@@ -17,10 +20,24 @@ HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 # Fuso horário local (America/Sao_Paulo)
 TZ = timezone(timedelta(hours=-3))
 
+# Quanto tempo um cache é considerado "fresco"
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 min por padrão
+
+# ===================== HTTP SESSION (pool + retry) =====================
+session = requests.Session()
+session.headers.update(HEADERS)
+retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
+adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
+
 # ===================== CACHE =====================
 dados_cache = []           # registros filtrados (ou brutos, se raw=1)
 cache_info  = {}           # meta da última coleta
 prev_cache  = {"date": None, "resumo": None, "graficos": None}
+
+cache_lock = Lock()
+last_fetch_at = None       # datetime da última coleta concluída
 
 # ===================== HELPERS =====================
 def now_local():
@@ -78,7 +95,7 @@ def fetch_api_data(start_dt_local: datetime, end_dt_local: datetime,
     Tolerância de +5min no final para não perder registros na virada.
 
     Filtros padrão (quando incluir_todas=False):
-      - speaking_time > 0
+      - speaking_time > 110s
       - agent não é '-' nem vazio
     """
     data_all = []
@@ -99,7 +116,8 @@ def fetch_api_data(start_dt_local: datetime, end_dt_local: datetime,
             break
         params = list(params_base.items()) + [("page", page)]
         try:
-            resp = requests.get(URL, headers=HEADERS, params=params, timeout=(5, 30))
+            # usa sessão com pool + retry
+            resp = session.get(URL, params=params, timeout=(10, 120))
         except Exception as e:
             print(f"[ERRO] Falha na página {page}: {e}")
             break
@@ -155,42 +173,82 @@ def index():
 def previous():
     return send_file(os.path.join(os.path.dirname(__file__), "dashboard_prev.html"))
 
+# ---- status rápido do cache (debug)
+@app.route("/api/status")
+def status():
+    global last_fetch_at
+    with cache_lock:
+        cached = len(dados_cache) > 0
+        last = last_fetch_at.isoformat() if last_fetch_at else None
+    age = None
+    if last_fetch_at:
+        age = int((now_local() - last_fetch_at).total_seconds())
+    return jsonify({
+        "cached": cached,
+        "last_fetch_at": last,
+        "age_seconds": age,
+        "ttl_seconds": CACHE_TTL_SECONDS,
+        "cache_info": cache_info
+    })
+
+# ---- coleta (agora não bloqueia se já houver cache)
 @app.route("/api/pegar")
 def pegar_dados():
     """
     Atualiza o cache com dados do 1º dia do mês passado até HOJE 23:59:59.
-    - Modo padrão: aplica filtros (speaking_time>0, agent válido)
-    - Modo bruto: adicionar ?raw=1 para pegar tudo (para comparação com 3C)
+    - Só força nova coleta se: ?force=1 OU cache ausente/stale (> TTL)
+    - Se existir cache (mesmo velho), dispara atualização em background e retorna rápido.
+    - Para comparar com 3C, use ?raw=1 para incluir tudo (sem filtros).
     """
-    global dados_cache, cache_info
+    global dados_cache, cache_info, last_fetch_at
 
-    hoje = now_local().date()
-    primeiro_deste_mes = hoje.replace(day=1)
-    ultimo_mes_passado = primeiro_deste_mes - timedelta(days=1)
-    inicio = datetime(ultimo_mes_passado.year, ultimo_mes_passado.month, 1, 0, 0, 0, tzinfo=TZ)
-    fim = datetime(hoje.year, hoje.month, hoje.day, 23, 59, 59, tzinfo=TZ)
+    def do_fetch(incluir_todas):
+        global dados_cache, cache_info, last_fetch_at
+        hoje = now_local().date()
+        primeiro_deste_mes = hoje.replace(day=1)
+        ultimo_mes_passado = primeiro_deste_mes - timedelta(days=1)
+        inicio = datetime(ultimo_mes_passado.year, ultimo_mes_passado.month, 1, 0, 0, 0, tzinfo=TZ)
+        fim = datetime(hoje.year, hoje.month, hoje.day, 23, 59, 59, tzinfo=TZ)
+        try:
+            dados, meta = fetch_api_data(
+                inicio, fim, per_page=500, page_max=500, incluir_todas=incluir_todas
+            )
+            with cache_lock:
+                # sobrescreve cache de maneira atômica
+                dados_cache[:] = dados
+                cache_info.clear()
+                cache_info.update(meta)
+                last_fetch_at = now_local()
+        except Exception as e:
+            print(f"[ERRO] do_fetch: {e}")
 
-    incluir_todas = "raw" in request.args  # ?raw=1 liga o modo bruto
+    incluir_todas = "raw" in request.args
+    force = request.args.get("force") == "1"
 
-    try:
-        dados, meta = fetch_api_data(
-            inicio, fim, per_page=500, page_max=500, incluir_todas=incluir_todas
-        )
-        dados_cache = dados
-        cache_info = meta
-        return jsonify({"status": "ok", "mensagem": "Dados prontos.", "meta": meta, "parcial": False})
-    except Exception as e:
-        return jsonify({"erro": f"Erro ao acessar a API: {e}"}), 500
+    with cache_lock:
+        cached = len(dados_cache) > 0
+        fresh = last_fetch_at and (now_local() - last_fetch_at).total_seconds() < CACHE_TTL_SECONDS
+
+    if force or not cached or not fresh:
+        if not cached and not fresh and not force:
+            # primeira carga: bloqueia (para evitar UI vazia)
+            do_fetch(incluir_todas)
+            return jsonify({"status": "ok", "mensagem": "Dados coletados.", "meta": cache_info, "parcial": False})
+        else:
+            # já existe cache? atualiza ao fundo e responde rápido
+            Thread(target=do_fetch, args=(incluir_todas,), daemon=True).start()
+            return jsonify({"status":"stale","mensagem":"Atualização em background iniciada.","meta":cache_info,"parcial":True})
+
+    # cache fresco
+    return jsonify({"status":"ok","mensagem":"Cache fresco.","meta":cache_info,"parcial":False})
 
 @app.route("/api/resumo")
 def resumo_ligacoes():
     """
     Agrega o que está no cache para os 3 cartões:
-      - Top conversão da semana (agente com mais 'Convertido' na semana)
+      - Top conversão da semana
       - Top vendas no mês
-      - Top ligações na semana (por contagem de ligações)
-
-    Obs: gráficos foram movidos para "do dia" na rota /api/graficos.
+      - Top ligações na semana
     """
     global dados_cache, prev_cache
     dados = dados_cache
@@ -223,13 +281,11 @@ def resumo_ligacoes():
         agente = normalize_agent_name(lig)
         qualificacao = (lig.get("qualification") or "")
 
-        # Semana
         if sem_ini <= data_lig <= sem_fim:
             lig_sem_ag[agente] = lig_sem_ag.get(agente, 0) + 1
             if qualificacao == "Convertido":
                 vendas_ag_sem[agente] = vendas_ag_sem.get(agente, 0) + 1
 
-        # Mês
         if mes_ini <= data_lig <= mes_fim and qualificacao == "Convertido":
             vendas_ag_mes[agente] = vendas_ag_mes.get(agente, 0) + 1
 
@@ -241,15 +297,10 @@ def resumo_ligacoes():
     ag_lig_sem = max_key(lig_sem_ag)
 
     resposta = {
-        # Top conversão semana
         "agente_venda_semana": ag_v_sem,
         "vendas_semana_agente": vendas_ag_sem.get(ag_v_sem, 0),
-
-        # Top vendas no mês
         "agente_venda_mes": ag_v_mes,
         "vendas_mes_agente": vendas_ag_mes.get(ag_v_mes, 0),
-
-        # Top ligações na semana
         "agente_ligacao_semana": ag_lig_sem,
         "ligacoes_semana_agente": lig_sem_ag.get(ag_lig_sem, 0),
     }
@@ -264,9 +315,8 @@ def resumo_ligacoes():
 def dados_graficos():
     """
     Dados p/ gráficos "do dia":
-      - top_vendas_hoje        (contagem por agente no dia)
-      - top_ligacoes_hoje      (contagem por agente no dia)
-
+      - top_vendas_hoje
+      - top_ligacoes_hoje
     Se ?prev, considera "ontem".
     """
     global dados_cache, prev_cache
@@ -299,11 +349,8 @@ def dados_graficos():
         agente = normalize_agent_name(lig)
         qualificacao = (lig.get("qualification") or "")
 
-        # vendas do dia
         if qualificacao == "Convertido":
             vendas_ag[agente] = vendas_ag.get(agente, 0) + 1
-
-        # ligações do dia (todas no cache já têm speaking_time>0 e agente válido)
         lig_ag[agente] = lig_ag.get(agente, 0) + 1
 
     resposta = {
