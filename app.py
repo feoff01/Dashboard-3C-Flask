@@ -217,7 +217,7 @@ def resumo_ligacoes():
         dur = tempo_para_segundos(lig.get("speaking_time", "00:00:00"))
 
         # Ligações semana: apenas > 100s
-        if sem_ini <= d <= sem_fim and dur > 100:
+        if sem_ini <= d <= sem_fim and dur > 1:
             lig_sem_por_ag[ag] += 1
 
         # Conversões (sem filtro de duração)
@@ -271,7 +271,7 @@ def dados_graficos():
         if not dt or dt.date() != dia: continue
         ag = normalize_agent_name(lig)
         dur = tempo_para_segundos(lig.get("speaking_time", "00:00:00"))
-        if dur > 100:
+        if dur > 1:
             lig_por_ag[ag] += 1
         if is_conversion_strict(lig):
             conv_por_ag[ag] += 1
