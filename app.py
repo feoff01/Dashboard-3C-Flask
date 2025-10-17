@@ -1,11 +1,11 @@
-# app.py — Dashboard 3C+ (coleta em background + cache TTL + session pooling)
-
+# app.py — Dashboard 3C+ (somente filtro de duração para ligações / sem salvar JSON)
 from flask import Flask, jsonify, send_file, request, Response
-import os, json, requests
+import os, json, re, requests
 from datetime import datetime, timedelta, timezone
 from threading import Thread, Lock
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from collections import defaultdict, Counter
 
 app = Flask(__name__)
 
@@ -14,373 +14,298 @@ TOKEN   = os.getenv("THREEC_TOKEN", "jKymeJxnAdcGIIZ7zxFjYJOp90j9QdHpMmBFSHlOwXp
 BASEURL = os.getenv("THREEC_BASEURL", "https://barsixp.3c.plus/api/v1")
 URL     = f"{BASEURL}/calls"
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
-
-# Fuso horário local (America/Sao_Paulo)
 TZ = timezone(timedelta(hours=-3))
-
-# Cache fresco por (padrão 15 min). Pode sobrescrever via variável de ambiente.
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
 
-# ===================== HTTP SESSION (pool + retry) =====================
+# ===================== HTTP SESSION =====================
 session = requests.Session()
 session.headers.update(HEADERS)
-retry = Retry(
-    total=3,
-    backoff_factor=0.6,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=False  # compatível com urllib3 em várias versões
-)
+retry = Retry(total=3, backoff_factor=0.6,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=False)
 adapter = HTTPAdapter(max_retries=retry, pool_connections=30, pool_maxsize=30)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
 # ===================== CACHE =====================
-dados_cache = []           # registros filtrados (ou brutos se raw=1)
-cache_info  = {}           # meta da última coleta
+dados_cache = []
+cache_info  = {}
 prev_cache  = {"date": None, "resumo": None, "graficos": None}
-
 cache_lock = Lock()
-last_fetch_at = None       # datetime da última coleta concluída
+last_fetch_at = None
+fetch_in_progress = False
+generation = 0
 
 # ===================== HELPERS =====================
-def now_local():
-    return datetime.now(TZ)
-
-def to_utc_str(dt):
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def tempo_para_segundos(hms: str) -> int:
+def now_local(): return datetime.now(TZ)
+def to_utc_str(dt): return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def tempo_para_segundos(hms): 
+    try: h, m, s = map(int, (hms or "00:00:00").split(":")); return h*3600+m*60+s
+    except: return 0
+def norm(s): return (s or "").strip().lower()
+def parse_date(date_str):
+    if not date_str: return None
     try:
-        h, m, s = map(int, (hms or "00:00:00").split(":"))
-        return h * 3600 + m * 60 + s
-    except Exception:
-        return 0
-
-def normalize_agent_name(lig) -> str:
-    name = (lig.get("agent") or lig.get("agent_name") or lig.get("user") or "").strip()
-    return name if name else "Desconhecido"
-
-def parse_date(date_str: str):
-    if not date_str:
-        return None
-    try:
-        if "T" in date_str:
-            return datetime.fromisoformat(date_str).astimezone(TZ)
+        if "T" in date_str: return datetime.fromisoformat(date_str).astimezone(TZ)
         return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
     except Exception:
-        try:
-            return datetime.strptime(date_str[:10], "%Y-%m-%d").replace(tzinfo=TZ)
-        except Exception:
-            return None
-
+        try: return datetime.strptime(date_str[:10], "%Y-%m-%d").replace(tzinfo=TZ)
+        except: return None
+def normalize_agent_name(lig): return (lig.get("agent") or lig.get("agent_name") or lig.get("user") or "Desconhecido").strip() or "Desconhecido"
+def is_conversion_strict(lig): return norm(lig.get("qualification")) == "convertido"
+def rank_stable(items): return sorted(items, key=lambda kv: (-kv[1], kv[0].lower()))
 def intervalos_anteriores(hoje_date):
-    primeiro_deste_mes = hoje_date.replace(day=1)
-    ultimo_mes_passado = primeiro_deste_mes - timedelta(days=1)
+    primeiro_mes = hoje_date.replace(day=1)
+    ultimo_mes_passado = primeiro_mes - timedelta(days=1)
     primeiro_mes_passado = ultimo_mes_passado.replace(day=1)
-    inicio_semana_atual = hoje_date - timedelta(days=hoje_date.weekday())  # segunda
-    fim_semana_passada = inicio_semana_atual - timedelta(days=1)           # domingo anterior
-    inicio_semana_passada = fim_semana_passada - timedelta(days=6)         # segunda anterior
+    inicio_semana_atual = hoje_date - timedelta(days=hoje_date.weekday())
+    fim_semana_passada = inicio_semana_atual - timedelta(days=1)
+    inicio_semana_passada = fim_semana_passada - timedelta(days=6)
     ontem = hoje_date - timedelta(days=1)
-    return {
-        "ontem": (ontem, ontem),
-        "semana_passada": (inicio_semana_passada, fim_semana_passada),
-        "mes_passado": (primeiro_mes_passado, ultimo_mes_passado),
-    }
+    return {"ontem": (ontem, ontem),
+            "semana_passada": (inicio_semana_passada, fim_semana_passada),
+            "mes_passado": (primeiro_mes_passado, ultimo_mes_passado)}
 
-# ===================== COLETA DA API =====================
-def fetch_api_data(start_dt_local: datetime, end_dt_local: datetime,
-                   per_page=500, page_max=500, incluir_todas=False):
-    """
-    Busca paginada no endpoint /calls usando 'call_date'.
-    Tolerância de +5min no final para não perder registros na virada.
-
-    Filtros padrão (quando incluir_todas=False):
-      - speaking_time > 110s
-      - agent não é '-' nem vazio
-    """
-    data_all = []
-    page = 1
-    total_pages = 0
-    field = "call_date"
-
-    end_dt_local = end_dt_local + timedelta(minutes=5)  # tolerância
-
+# ===================== COLETA DA API (com logs) =====================
+def fetch_api_data(start_dt_local, end_dt_local, per_page=500, page_max=500, incluir_todas=False):
+    data_all, page, total_pages = [], 1, 0
+    end_dt_local += timedelta(minutes=5)
     params_base = {
-        f"filters[{field}][from]": to_utc_str(start_dt_local),
-        f"filters[{field}][to]":   to_utc_str(end_dt_local),
+        "filters[call_date][from]": to_utc_str(start_dt_local),
+        "filters[call_date][to]": to_utc_str(end_dt_local),
         "per_page": per_page,
     }
 
+    print("\n=== Iniciando coleta da API 3C ===")
+    print(f"Período local: {start_dt_local.isoformat()} → {end_dt_local.isoformat()}")
+    print("==================================\n")
+
     while True:
         if page > page_max:
+            print(f"[STOP] Limite de {page_max} páginas atingido.")
             break
+
         params = list(params_base.items()) + [("page", page)]
+        print(f"[→] Requisitando página {page} ...")
         try:
             resp = session.get(URL, params=params, timeout=(10, 120))
         except Exception as e:
-            print(f"[ERRO] Falha na página {page}: {e}")
+            print(f"[ERRO] Falha ao requisitar página {page}: {e}")
             break
 
         if resp.status_code != 200:
-            print(f"[{page}] HTTP {resp.status_code}")
+            print(f"[ERRO] página {page}: HTTP {resp.status_code}")
             break
 
         payload = resp.json()
-        page_data = payload.get("data", [])
-        if not page_data:
+        bloco = payload.get("data", [])
+        if not bloco:
+            print(f"[OK] Página {page} retornou 0 registros — fim da coleta.")
             break
 
-        mantidos = 0
-        for lig in page_data:
-            if incluir_todas:
-                data_all.append(lig)
-                mantidos += 1
-                continue
-
-            agente = str(lig.get("agent", "")).strip()
-            tempo_falado = tempo_para_segundos(lig.get("speaking_time", "00:00:00"))
-            if tempo_falado <= 110:
-                continue
-            if not agente or agente == "-":
-                continue
-
+        print(f"[✔] Página {page} carregada com {len(bloco)} registros.")
+        for lig in bloco:
+            if not incluir_todas:
+                agente = str(lig.get("agent") or "").strip()
+                if not agente or agente == "-": continue
             data_all.append(lig)
-            mantidos += 1
 
-        print(f"[{page}] registros={len(page_data)}  mantidos={mantidos}")
         total_pages += 1
         page += 1
+
+    print(f"\n✅ Coleta concluída — {len(data_all)} registros válidos em {total_pages} páginas.")
+    print("==================================\n")
 
     meta = {
         "base_url": URL,
         "from_local": start_dt_local.isoformat(),
         "to_local": end_dt_local.isoformat(),
-        "per_page": per_page,
         "pages_fetched": total_pages,
         "total_after_filters": len(data_all),
-        "incluir_todas": incluir_todas,
     }
     return data_all, meta
 
-# ===================== ROTAS WEB (DASHBOARD) =====================
+# ===================== ROTAS =====================
 @app.route("/")
-def index():
-    return send_file(os.path.join(os.path.dirname(__file__), "dashboard.html"))
-
+def index(): return send_file(os.path.join(os.path.dirname(__file__), "dashboard.html"))
 @app.route("/previous")
-def previous():
-    return send_file(os.path.join(os.path.dirname(__file__), "dashboard_prev.html"))
+def previous(): return send_file(os.path.join(os.path.dirname(__file__), "dashboard_prev.html"))
 
-# ---- status rápido do cache (debug/monitoramento)
 @app.route("/api/status")
 def status():
-    global last_fetch_at
     with cache_lock:
-        cached = len(dados_cache) > 0
         meta = dict(cache_info)
+        gen = generation
+        cached = len(dados_cache) > 0
     last = last_fetch_at.isoformat() if last_fetch_at else None
     age = int((now_local() - last_fetch_at).total_seconds()) if last_fetch_at else None
     return jsonify({
-        "cached": cached,
-        "last_fetch_at": last,
-        "age_seconds": age,
-        "ttl_seconds": CACHE_TTL_SECONDS,
-        "cache_info": meta
+        "cached": cached, "fetch_in_progress": fetch_in_progress, "generation": gen,
+        "last_fetch_at": last, "age_seconds": age,
+        "ttl_seconds": CACHE_TTL_SECONDS, "cache_info": meta
     })
 
-# ---- coleta: AGORA SEM BLOQUEAR O WORKER (thread em background)
 @app.route("/api/pegar")
 def pegar_dados():
-    """
-    Atualiza o cache com dados do 1º dia do mês passado até HOJE 23:59:59.
-    - Se não houver cache, dispara background e responde "fetching".
-    - Se houver cache, dispara background e responde "stale".
-    - Use ?force=1 para forçar nova coleta.
-    - Use ?raw=1 para incluir TUDO (sem filtros), apenas para diagnóstico.
-    """
-    global dados_cache, cache_info, last_fetch_at
-
+    global last_fetch_at, fetch_in_progress, generation
     incluir_todas = "raw" in request.args
     force = request.args.get("force") == "1"
 
-    def do_fetch_background(_incluir_todas: bool):
-        global dados_cache, cache_info, last_fetch_at
+    def do_fetch(_incluir_todas):
+        global last_fetch_at, fetch_in_progress, generation
         try:
-            hoje = now_local().date()
-            primeiro_deste_mes = hoje.replace(day=1)
-            ultimo_mes_passado = primeiro_deste_mes - timedelta(days=1)
+            fetch_in_progress = True
+            today = now_local().date()
+            primeiro_mes = today.replace(day=1)
+            ultimo_mes_passado = primeiro_mes - timedelta(days=1)
             inicio = datetime(ultimo_mes_passado.year, ultimo_mes_passado.month, 1, 0, 0, 0, tzinfo=TZ)
-            fim = datetime(hoje.year, hoje.month, hoje.day, 23, 59, 59, tzinfo=TZ)
+            fim = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=TZ)
 
-            dados, meta = fetch_api_data(
-                inicio, fim, per_page=500, page_max=500, incluir_todas=_incluir_todas
-            )
-
+            dados, meta = fetch_api_data(inicio, fim, incluir_todas=_incluir_todas)
             with cache_lock:
                 dados_cache[:] = dados
-                cache_info.clear()
-                cache_info.update(meta)
+                cache_info.clear(); cache_info.update(meta)
                 last_fetch_at = now_local()
-
-            print("✅ Atualização do cache concluída.")
+                prev_cache["date"] = prev_cache["resumo"] = prev_cache["graficos"] = None
+                generation += 1
+            print("✅ Cache atualizado.")
         except Exception as e:
             print(f"[ERRO em thread de coleta] {e}")
+        finally:
+            fetch_in_progress = False
 
     with cache_lock:
         cached = len(dados_cache) > 0
         fresh = last_fetch_at and (now_local() - last_fetch_at).total_seconds() < CACHE_TTL_SECONDS
 
     if force or not cached or not fresh:
-        Thread(target=do_fetch_background, args=(incluir_todas,), daemon=True).start()
-        status = "stale" if cached else "fetching"
-        return jsonify({
-            "status": status,
-            "mensagem": "Coleta iniciada em background — pode levar vários minutos.",
-            "meta": cache_info
-        })
-
+        Thread(target=do_fetch, args=(incluir_todas,), daemon=True).start()
+        return jsonify({"status": ("stale" if cached else "fetching"),
+                        "mensagem": "Coleta iniciada em background.",
+                        "meta": cache_info})
     return jsonify({"status": "ok", "mensagem": "Cache fresco.", "meta": cache_info})
 
-# ---- cartões
+# ---- Resumo com filtro de duração para ligações semana
 @app.route("/api/resumo")
 def resumo_ligacoes():
-    global dados_cache, prev_cache
-    dados = dados_cache
+    with cache_lock: dados = list(dados_cache)
     anterior = request.args.get("prev") is not None
-
-    hoje = now_local().date()
-    hoje_str = hoje.strftime("%Y-%m-%d")
+    base = now_local().date()
+    hoje_str = base.strftime("%Y-%m-%d")
 
     if anterior and prev_cache["date"] == hoje_str and prev_cache["resumo"]:
         return jsonify(prev_cache["resumo"])
 
     if anterior:
-        (sem_ini, sem_fim) = intervalos_anteriores(hoje)["semana_passada"]
-        (mes_ini, mes_fim) = intervalos_anteriores(hoje)["mes_passado"]
+        (sem_ini, sem_fim) = intervalos_anteriores(base)["semana_passada"]
+        (mes_ini, mes_fim) = intervalos_anteriores(base)["mes_passado"]
     else:
-        sem_ini = hoje - timedelta(days=hoje.weekday())
-        sem_fim = hoje
-        mes_ini = hoje.replace(day=1)
-        mes_fim = hoje
+        sem_ini = base - timedelta(days=base.weekday())
+        sem_fim = base
+        mes_ini = base.replace(day=1)
+        mes_fim = base
 
-    vendas_ag_sem, vendas_ag_mes = {}, {}
-    lig_sem_ag = {}
+    conv_sem_por_ag = defaultdict(int)
+    conv_mes_por_ag = defaultdict(int)
+    lig_sem_por_ag = defaultdict(int)
 
     for lig in dados:
-        raw_date = lig.get("call_date_rfc3339") or lig.get("call_date")
-        dt = parse_date(raw_date)
-        if not dt:
-            continue
-        data_lig = dt.date()
-        agente = normalize_agent_name(lig)
-        qualificacao = (lig.get("qualification") or "")
+        dt = parse_date(lig.get("call_date_rfc3339") or lig.get("call_date"))
+        if not dt: continue
+        d = dt.date()
+        ag = normalize_agent_name(lig)
+        dur = tempo_para_segundos(lig.get("speaking_time", "00:00:00"))
 
-        if sem_ini <= data_lig <= sem_fim:
-            lig_sem_ag[agente] = lig_sem_ag.get(agente, 0) + 1
-            if qualificacao == "Convertido":
-                vendas_ag_sem[agente] = vendas_ag_sem.get(agente, 0) + 1
+        # Ligações semana: apenas > 100s
+        if sem_ini <= d <= sem_fim and dur > 100:
+            lig_sem_por_ag[ag] += 1
 
-        if mes_ini <= data_lig <= mes_fim and qualificacao == "Convertido":
-            vendas_ag_mes[agente] = vendas_ag_mes.get(agente, 0) + 1
+        # Conversões (sem filtro de duração)
+        if is_conversion_strict(lig):
+            if sem_ini <= d <= sem_fim:
+                conv_sem_por_ag[ag] += 1
+            if mes_ini <= d <= mes_fim:
+                conv_mes_por_ag[ag] += 1
 
-    def max_key(d):
-        return max(d, key=d.get) if d else "Nenhum agente"
-
-    ag_v_sem   = max_key(vendas_ag_sem)
-    ag_v_mes   = max_key(vendas_ag_mes)
-    ag_lig_sem = max_key(lig_sem_ag)
+    ag_v_sem = next(iter(rank_stable(conv_sem_por_ag.items())), ("Nenhum agente", 0))[0]
+    ag_v_mes = next(iter(rank_stable(conv_mes_por_ag.items())), ("Nenhum agente", 0))[0]
+    ag_lig_sem = next(iter(rank_stable(lig_sem_por_ag.items())), ("Nenhum agente", 0))[0]
 
     resposta = {
         "agente_venda_semana": ag_v_sem,
-        "vendas_semana_agente": vendas_ag_sem.get(ag_v_sem, 0),
+        "vendas_semana_agente": int(conv_sem_por_ag.get(ag_v_sem, 0)),
         "agente_venda_mes": ag_v_mes,
-        "vendas_mes_agente": vendas_ag_mes.get(ag_v_mes, 0),
+        "vendas_mes_agente": int(conv_mes_por_ag.get(ag_v_mes, 0)),
         "agente_ligacao_semana": ag_lig_sem,
-        "ligacoes_semana_agente": lig_sem_ag.get(ag_lig_sem, 0),
+        "ligacoes_semana_agente": int(lig_sem_por_ag.get(ag_lig_sem, 0)),
+        "ranking_conversoes_semana": rank_stable(conv_sem_por_ag.items()),
+        "ranking_conversoes_mes": rank_stable(conv_mes_por_ag.items()),
+        "ranking_ligacoes_semana": rank_stable(lig_sem_por_ag.items()),
     }
-
     if anterior:
         prev_cache["date"] = hoje_str
         prev_cache["resumo"] = resposta
-
     return jsonify(resposta)
 
-# ---- gráficos (dia/ontem)
+# ---- Gráficos com filtro de duração (>100s)
 @app.route("/api/graficos")
 def dados_graficos():
-    global dados_cache, prev_cache
-    dados = dados_cache
+    with cache_lock: dados = list(dados_cache)
     anterior = request.args.get("prev") is not None
-
-    hoje = now_local().date()
-    hoje_str = hoje.strftime("%Y-%m-%d")
+    base = now_local().date()
+    hoje_str = base.strftime("%Y-%m-%d")
 
     if anterior and prev_cache["date"] == hoje_str and prev_cache["graficos"]:
         return jsonify(prev_cache["graficos"])
 
     if anterior:
-        dia_base = intervalos_anteriores(hoje)["ontem"][0]
-        dia_ini, dia_fim = dia_base, dia_base
+        dia = intervalos_anteriores(base)["ontem"][0]
     else:
-        dia_ini, dia_fim = hoje, hoje
+        dia = base
 
-    vendas_ag, lig_ag = {}, {}
+    conv_por_ag = defaultdict(int)
+    lig_por_ag = defaultdict(int)
 
     for lig in dados:
-        raw_date = lig.get("call_date_rfc3339") or lig.get("call_date")
-        dt = parse_date(raw_date)
-        if not dt:
-            continue
-        data_lig = dt.date()
-        if not (dia_ini <= data_lig <= dia_fim):
-            continue
+        dt = parse_date(lig.get("call_date_rfc3339") or lig.get("call_date"))
+        if not dt or dt.date() != dia: continue
+        ag = normalize_agent_name(lig)
+        dur = tempo_para_segundos(lig.get("speaking_time", "00:00:00"))
+        if dur > 100:
+            lig_por_ag[ag] += 1
+        if is_conversion_strict(lig):
+            conv_por_ag[ag] += 1
 
-        agente = normalize_agent_name(lig)
-        qualificacao = (lig.get("qualification") or "")
-
-        if qualificacao == "Convertido":
-            vendas_ag[agente] = vendas_ag.get(agente, 0) + 1
-        lig_ag[agente] = lig_ag.get(agente, 0) + 1
-
-    resposta = {
-        "top_vendas_hoje": sorted(vendas_ag.items(), key=lambda x: x[1], reverse=True)[:5],
-        "top_ligacoes_hoje": sorted(lig_ag.items(), key=lambda x: x[1], reverse=True)[:5]
+    resp = {
+        "top_vendas_hoje": rank_stable(conv_por_ag.items())[:5],
+        "top_ligacoes_hoje": rank_stable(lig_por_ag.items())[:5],
     }
-
     if anterior:
         prev_cache["date"] = hoje_str
-        prev_cache["graficos"] = resposta
+        prev_cache["graficos"] = resp
+    return jsonify(resp)
 
-    return jsonify(resposta)
-
-# ===================== ROTAS DE DIAGNÓSTICO =====================
-@app.route("/api/debug_sample")
-def debug_sample():
-    return Response(json.dumps(dados_cache[:20], indent=2, ensure_ascii=False),
-                    mimetype="application/json")
-
-@app.route("/api/agents_all")
-def agents_all():
-    uniq, seen = [], set()
-    for lig in dados_cache:
-        name = normalize_agent_name(lig)
-        if name and name not in seen and name != "-":
-            seen.add(name); uniq.append(name)
-    uniq.sort(key=lambda s: s.lower())
-    body = {"unique_agents": len(uniq), "agents": uniq, "cache_meta": cache_info}
-    return Response(json.dumps(body, indent=2, ensure_ascii=False), mimetype="application/json")
-
-@app.route("/api/agents_overview")
-def agents_overview():
-    from collections import Counter
-    c = Counter()
-    for lig in dados_cache:
-        name = normalize_agent_name(lig)
-        if name and name != "-":
-            c[name] += 1
-    top = [{"agent": k, "calls": v} for k, v in c.most_common()]
-    body = {"total_calls_in_cache": len(dados_cache), "by_agent": top, "cache_meta": cache_info}
-    return Response(json.dumps(body, indent=2, ensure_ascii=False), mimetype="application/json")
+# ---- Auditoria
+@app.route("/api/audit/conversoes")
+def audit_conversoes():
+    with cache_lock: dados = list(dados_cache)
+    base = now_local().date()
+    if request.args.get("prev"):
+        (sem_ini, sem_fim) = intervalos_anteriores(base)["semana_passada"]
+        (mes_ini, mes_fim) = intervalos_anteriores(base)["mes_passado"]
+    else:
+        sem_ini = base - timedelta(days=base.weekday())
+        sem_fim = base
+        mes_ini = base.replace(day=1)
+        mes_fim = base
+    conv_sem, conv_mes = defaultdict(int), defaultdict(int)
+    for lig in dados:
+        dt = parse_date(lig.get("call_date_rfc3339") or lig.get("call_date"))
+        if not dt or not is_conversion_strict(lig): continue
+        d = dt.date(); ag = normalize_agent_name(lig)
+        if sem_ini <= d <= sem_fim: conv_sem[ag] += 1
+        if mes_ini <= d <= mes_fim: conv_mes[ag] += 1
+    return jsonify({"semana": rank_stable(conv_sem.items()), "mes": rank_stable(conv_mes.items())})
 
 # ===================== MAIN =====================
 if __name__ == "__main__":
