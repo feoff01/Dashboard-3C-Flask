@@ -79,12 +79,12 @@
       <div id="topVendasMes">-</div>
     </div>
     <div class="cartao cor-laranja">
-      <strong>📞 SDR mais Intenso da Semana </strong>
+      <strong>📞 Top ligações na semana</strong>
       <div id="topLigacoesSemana">-</div>
     </div>
   </div>
 
-  <!-- Gráficos (DO DIA) -->
+  <!-- Gráficos -->
   <div class="graficos-wrapper">
     <div class="grafico-container">
       <h2>Top 5 — Conversões hoje</h2>
@@ -125,25 +125,24 @@
     }
 
     async function carregarGraficosDia() {
-      if (chartVendasHoje)  chartVendasHoje.destroy();
+      if (chartVendasHoje) chartVendasHoje.destroy();
       if (chartLigacoesHoje) chartLigacoesHoje.destroy();
 
       try {
         const resp = await fetch("/api/graficos");
         const dados = await resp.json();
 
-        // ====== Conversões ======
+        // Conversões
         const nomesVendasHoje = dados.top_vendas_hoje.map(i => i[0]);
-        const vendasHoje      = dados.top_vendas_hoje.map(i => i[1]);
+        const vendasHoje = dados.top_vendas_hoje.map(i => i[1]);
 
-        // ====== Ligações empilhadas ======
+        // Ligações empilhadas
         const stk = (dados.top_ligacoes_hoje_stack || []).filter(x => x.total > 0);
         const nomesLigHoje = stk.map(x => x.agente);
-        const totalLig     = stk.map(x => x.total);
-        const longLig      = stk.map(x => x.acima_110);
-        const shortLig     = totalLig.map((t, i) => Math.max(t - longLig[i], 0));
+        const totalLig = stk.map(x => x.total);
+        const longLig = stk.map(x => x.acima_110);
+        const shortLig = totalLig.map((t, i) => Math.max(t - longLig[i], 0));
 
-        // Base de estilos
         const optionsBase = {
           responsive: true,
           maintainAspectRatio: false,
@@ -151,26 +150,19 @@
           plugins: { legend: { display: false } },
           scales: {
             x: {
-              ticks:{
-                font:{ size:16 },
-                padding:10,
-                callback: function(value) {
-                  const label = this.getLabelForValue(value);
-                  return label.length > 14 ? label.match(/.{1,14}/g) : label;
-                }
-              },
+              ticks:{ font:{ size:16 }, padding:10 },
               grid:{ display:false }
             },
             y: {
               beginAtZero:true,
               grace: '25%',
-              ticks:{ font:{ size:14 }},
+              ticks:{ font:{ size:16 }},
               grid:{ display:false }
             }
           }
         };
 
-        // ====== Gráfico Conversões ======
+        // ===== Gráfico Conversões =====
         chartVendasHoje = new Chart(
           document.getElementById("graficoVendasHoje").getContext("2d"),
           {
@@ -204,7 +196,7 @@
                   borderColor:'#ccc',
                   padding:{top:6,bottom:6,left:10,right:10},
                   color:'#000',
-                  font:{weight:'bold', size:16}, // 👈 tamanho da fonte
+                  font:{weight:'bold', size:24}, // 👈 Aumentei para 24px
                   formatter:v=>v
                 }
               }
@@ -213,17 +205,17 @@
           }
         );
 
-        // ====== Plugin badges (total e >1:50) ======
+        // ===== Plugin valores (para o gráfico de ligações) =====
         const pluginValores = {
           id: 'pluginValores',
           afterDatasetsDraw(chart) {
             const { ctx, data, scales: { x, y } } = chart;
             const dsOrange = data.datasets[0];
-            const dsBlue   = data.datasets[1];
+            const dsBlue = data.datasets[1];
 
-            const drawBadge = (text, xCenter, yBottom, offset = 4, fontSize = 16) => {
+            const drawBadge = (text, xCenter, yBottom, offset = 4, fontSize = 22) => {
               ctx.font = `bold ${fontSize}px Arial`;
-              const w = ctx.measureText(text).width + 12;
+              const w = ctx.measureText(text).width + 14;
               const h = fontSize + 6;
               const r = 6;
               const x0 = Math.round(xCenter - w / 2);
@@ -252,20 +244,19 @@
             data.labels.forEach((_, i) => {
               const xPos = x.getPixelForValue(i);
               const orangeVal = dsOrange.data[i] || 0;
-              const blueVal   = dsBlue.data[i]   || 0;
-              const total     = orangeVal + blueVal;
+              const blueVal = dsBlue.data[i] || 0;
+              const total = orangeVal + blueVal;
 
               const yTopOrange = y.getPixelForValue(orangeVal);
-              if (orangeVal > 0) drawBadge(String(orangeVal), xPos, yTopOrange, 4, 16); // 👈 >1:50
-
+              if (orangeVal > 0) drawBadge(String(orangeVal), xPos, yTopOrange, 4, 20); // 👈 >1:50 aumentado
               const yTopTotal = y.getPixelForValue(total);
-              drawBadge(String(total), xPos, yTopTotal, 12, 16); // 👈 TOTAL
+              drawBadge(String(total), xPos, yTopTotal, 12, 26); // 👈 total aumentado
             });
             ctx.restore();
           }
         };
 
-        // ====== Gráfico Ligações Empilhadas ======
+        // ===== Gráfico Ligações =====
         chartLigacoesHoje = new Chart(
           document.getElementById("graficoLigacoesHoje").getContext("2d"),
           {
@@ -284,15 +275,7 @@
                 x: { ...optionsBase.scales.x, stacked: true },
                 y: { ...optionsBase.scales.y, stacked: true }
               },
-              plugins: {
-                ...optionsBase.plugins,
-                datalabels: { display: false },
-                tooltip: {
-                  callbacks: {
-                    label: (ctx) => `${ctx.dataset.label}: ${ctx.formattedValue}`
-                  }
-                }
-              }
+              plugins: { ...optionsBase.plugins, datalabels: { display: false } }
             },
             plugins: [pluginValores]
           }
@@ -315,4 +298,3 @@
   </script>
 </body>
 </html>
-
