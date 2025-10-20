@@ -9,8 +9,7 @@
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; height: 100vh; font-family: Arial, sans-serif; background: #f8f9fa; }
     body { display: flex; flex-direction: column; padding: 0 20px 20px 20px; }
-    h1 { color: #111; font-size: 42px; margin-bottom: 15px; }
-    #mensagemStatus { font-weight: bold; font-size: 22px; margin-bottom: 20px; }
+    #mensagemStatus { font-weight: bold; font-size: 22px; margin: 12px 0 16px; }
 
     /* ---- Cartões ---- */
     .linha-top {
@@ -38,40 +37,24 @@
     }
     .cartao strong { font-size: 22px; color: #222; }
     .cartao div { font-size: 24px; font-weight: bold; margin-top: 6px; }
-    .cartao-central { grid-column: 2; } /* centraliza na coluna do meio */
+    .cartao-central { grid-column: 2; }
 
     .cor-verde{background:#d1e7dd;}
     .cor-azul{background:#cff4fc;}
     .cor-laranja{background:#fce5cd;}
 
     /* ---- Gráficos ---- */
-    .graficos-wrapper {
-      display: flex;
-      gap: 20px;
-      margin-top: 10px;
-
-      /* Ocupa todo o espaço restante da viewport */
-      flex: 1;
-      min-height: 0; /* evita overflow interno */
+    .graficos-wrapper{
+      display:flex; gap:20px; margin-top:10px;
+      flex:1; min-height:0;
     }
-    .grafico-container {
-      background: #fff;
-      padding: 20px;
-      border-radius: 10px;
-      box-shadow: 0 2px 6px rgba(0,0,0,.1);
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-      flex: 1;
-      min-height: 0;
+    .grafico-container{
+      background:#fff; padding:20px; border-radius:10px; box-shadow:0 2px 6px rgba(0,0,0,.1);
+      display:flex; flex-direction:column; overflow:visible;
+      flex:1; min-height:0;
     }
     .grafico-container h2 { font-size: 26px; margin-bottom: 10px; }
-    canvas {
-      flex: 1;
-      width: 100% !important;
-      height: 100% !important;
-      min-height: 0;
-    }
+    canvas { flex:1; width:100% !important; height:100% !important; min-height:0; }
 
     #btnAnterior { position: fixed; top: 15px; right: 25px; background: #0d6efd; color: #fff; padding: 10px 18px; border-radius: 8px; font-weight: bold; text-decoration: none; box-shadow: 0 2px 6px rgba(0,0,0,.25); }
     #btnAnterior:hover { background:#084298; }
@@ -81,7 +64,7 @@
   <a href="/previous" id="btnAnterior">← Período anterior</a>
   <div id="mensagemStatus">Carregando...</div>
 
-  <!-- Linha 1: cartão único centralizado -->
+  <!-- Linha 1 -->
   <div class="linha-top">
     <div class="cartao cartao-central cor-verde">
       <strong>👑 Top conversão da semana</strong>
@@ -89,7 +72,7 @@
     </div>
   </div>
 
-  <!-- Linha 2: dois cartões lado a lado -->
+  <!-- Linha 2 -->
   <div class="linha-meio">
     <div class="cartao cor-azul">
       <strong>🏆 Top Agente conversão no mês</strong>
@@ -117,139 +100,218 @@
     let chartVendasHoje = null;
     let chartLigacoesHoje = null;
 
-    async function pegarDados() {
-      const msg = document.getElementById("mensagemStatus");
-      msg.style.color = "black";
-      msg.textContent = "⏳ Buscando dados da API...";
-      try {
-        const resp = await fetch("/api/pegar");
-        const json = await resp.json();
-
-        if (json.status === "ok" && json.parcial) {
-          msg.style.color = "#8a6d3b";
-          msg.textContent = "⚠️ Dados atualizados parcialmente (algumas janelas expiraram).";
-        } else if (json.status === "ok") {
-          msg.style.color = "green";
-          msg.textContent = "📊 Dados atualizados na tela.";
-        } else {
-          msg.style.color = "red";
-          msg.textContent = "⚠️ Erro ao buscar dados: " + (json.erro || "erro desconhecido");
-        }
-      } catch (e) {
-        msg.style.color = "red";
-        msg.textContent = "❌ Erro na requisição.";
-        console.error(e);
-      }
-    }
-
     async function carregarResumo() {
+      const msg = document.getElementById("mensagemStatus");
       try {
-        const resp   = await fetch("/api/resumo");
-        const r = await resp.json();
+        const r = await fetch("/api/resumo");
+        const data = await r.json();
 
-        // Cartão 1: Top conversão da semana
         document.getElementById("topConversaoSemana").textContent =
-          `${r.agente_venda_semana} (${r.vendas_semana_agente})`;
+          `${data.agente_venda_semana} (${data.vendas_semana_agente})`;
 
-        // Cartão 2: Top vendas no mês
         document.getElementById("topVendasMes").textContent =
-          `${r.agente_venda_mes} (${r.vendas_mes_agente})`;
+          `${data.agente_venda_mes} (${data.vendas_mes_agente})`;
 
-        // Cartão 3: Top ligações na semana
         document.getElementById("topLigacoesSemana").textContent =
-          `${r.agente_ligacao_semana} (${r.ligacoes_semana_agente})`;
+          `${data.agente_ligacao_semana} (${data.ligacoes_semana_agente})`;
 
-        const msg = document.getElementById("mensagemStatus");
         msg.textContent = "📊 Dados atualizados na tela.";
         msg.style.color = "green";
       } catch (e) {
-        console.error("Erro ao carregar resumo:", e);
-        document.getElementById("mensagemStatus").textContent = "❌ Falha ao atualizar os dados na tela.";
-        document.getElementById("mensagemStatus").style.color = "red";
+        console.error(e);
+        msg.textContent = "❌ Falha ao atualizar dados.";
+        msg.style.color = "red";
       }
     }
 
     async function carregarGraficosDia() {
-      if (chartVendasHoje) chartVendasHoje.destroy();
+      if (chartVendasHoje)  chartVendasHoje.destroy();
       if (chartLigacoesHoje) chartLigacoesHoje.destroy();
 
       try {
         const resp = await fetch("/api/graficos");
         const dados = await resp.json();
 
-        const nomesVendasHoje = dados.top_vendas_hoje.map(i => i[0].split(" ")[0]);
-        const vendasHoje = dados.top_vendas_hoje.map(i => i[1]);
+        // ====== Conversões ======
+        const nomesVendasHoje = dados.top_vendas_hoje.map(i => i[0]);
+        const vendasHoje      = dados.top_vendas_hoje.map(i => i[1]);
 
-        const nomesLigHoje = dados.top_ligacoes_hoje.map(i => i[0].split(" ")[0]);
-        const ligHoje = dados.top_ligacoes_hoje.map(i => i[1]);
+        // ====== Ligações empilhadas ======
+        const stk = (dados.top_ligacoes_hoje_stack || []).filter(x => x.total > 0);
+        const nomesLigHoje = stk.map(x => x.agente);
+        const totalLig     = stk.map(x => x.total);
+        const longLig      = stk.map(x => x.acima_110);
+        const shortLig     = totalLig.map((t, i) => Math.max(t - longLig[i], 0));
 
-        const cores = [
-          'rgba(173, 216, 230, 0.9)',
-          'rgba(75, 192, 75, 0.9)',
-          'rgba(255, 206, 86, 0.9)',
-          'rgba(0, 123, 255, 0.9)',
-          'rgba(153, 102, 255, 0.9)'
-        ];
-
+        // Base de estilos
         const optionsBase = {
           responsive: true,
           maintainAspectRatio: false,
-          layout: { padding: { top: 30, bottom: 50 } },
-          plugins: {
-            legend: { display: false },
-            datalabels: {
-              anchor:'end', align:'end', backgroundColor:'#fff9c4',
-              borderRadius:6, borderWidth:1, borderColor:'#ccc',
-              padding:{top:6,bottom:6,left:10,right:10}, color:'#000',
-              font:{weight:'bold', size:18}, formatter:v=>v
-            }
-          },
+          layout: { padding: { top: 24, bottom: 40 } },
+          plugins: { legend: { display: false } },
           scales: {
-            x: { ticks:{ font:{ size:20 }, maxRotation:10, minRotation:10, padding:10 }, grid:{ display:false }},
-            y: { beginAtZero:true, ticks:{ font:{ size:16 }}, grid:{ display:false } }
+            x: {
+              ticks:{
+                font:{ size:16 },
+                padding:10,
+                callback: function(value) {
+                  const label = this.getLabelForValue(value);
+                  return label.length > 14 ? label.match(/.{1,14}/g) : label;
+                }
+              },
+              grid:{ display:false }
+            },
+            y: {
+              beginAtZero:true,
+              grace: '25%',
+              ticks:{ font:{ size:14 }},
+              grid:{ display:false }
+            }
           }
         };
 
-        chartVendasHoje = new Chart(document.getElementById("graficoVendasHoje").getContext("2d"), {
-          type: "bar",
-          data: { labels: nomesVendasHoje, datasets: [{ label: "Conversções (hoje)", data: vendasHoje, backgroundColor: cores.slice(0, vendasHoje.length) }] },
-          options: optionsBase,
-          plugins: [ChartDataLabels]
-        });
+        // ====== Gráfico Conversões ======
+        chartVendasHoje = new Chart(
+          document.getElementById("graficoVendasHoje").getContext("2d"),
+          {
+            type: "bar",
+            data: {
+              labels: nomesVendasHoje,
+              datasets: [{
+                label: "Conversões (hoje)",
+                data: vendasHoje,
+                backgroundColor: [
+                  'rgba(173,216,230,0.9)',
+                  'rgba(75,192,75,0.9)',
+                  'rgba(255,206,86,0.9)',
+                  'rgba(0,123,255,0.9)',
+                  'rgba(153,102,255,0.9)'
+                ].slice(0, vendasHoje.length)
+              }]
+            },
+            options: {
+              ...optionsBase,
+              plugins: {
+                ...optionsBase.plugins,
+                datalabels: {
+                  display: true,
+                  anchor: 'end',
+                  align: 'top',
+                  offset: 6,
+                  backgroundColor:'#fff9c4',
+                  borderRadius:6,
+                  borderWidth:1,
+                  borderColor:'#ccc',
+                  padding:{top:6,bottom:6,left:10,right:10},
+                  color:'#000',
+                  font:{weight:'bold', size:16}, // 👈 tamanho da fonte
+                  formatter:v=>v
+                }
+              }
+            },
+            plugins: [ChartDataLabels]
+          }
+        );
 
-        chartLigacoesHoje = new Chart(document.getElementById("graficoLigacoesHoje").getContext("2d"), {
-          type: "bar",
-          data: { labels: nomesLigHoje, datasets: [{ label: "Ligações (hoje)", data: ligHoje, backgroundColor: cores.slice(0, ligHoje.length) }] },
-          options: optionsBase,
-          plugins: [ChartDataLabels]
-        });
+        // ====== Plugin badges (total e >1:50) ======
+        const pluginValores = {
+          id: 'pluginValores',
+          afterDatasetsDraw(chart) {
+            const { ctx, data, scales: { x, y } } = chart;
+            const dsOrange = data.datasets[0];
+            const dsBlue   = data.datasets[1];
+
+            const drawBadge = (text, xCenter, yBottom, offset = 4, fontSize = 16) => {
+              ctx.font = `bold ${fontSize}px Arial`;
+              const w = ctx.measureText(text).width + 12;
+              const h = fontSize + 6;
+              const r = 6;
+              const x0 = Math.round(xCenter - w / 2);
+              const y0 = Math.round(yBottom - h - offset);
+
+              ctx.beginPath();
+              ctx.moveTo(x0 + r, y0);
+              ctx.arcTo(x0 + w, y0, x0 + w, y0 + h, r);
+              ctx.arcTo(x0 + w, y0 + h, x0, y0 + h, r);
+              ctx.arcTo(x0, y0 + h, x0, y0, r);
+              ctx.arcTo(x0, y0, x0 + w, y0, r);
+              ctx.closePath();
+              ctx.fillStyle = '#fff5bf';
+              ctx.fill();
+              ctx.strokeStyle = '#d9cf95';
+              ctx.lineWidth = 1;
+              ctx.stroke();
+
+              ctx.fillStyle = '#000';
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'middle';
+              ctx.fillText(text, x0 + w / 2, y0 + h / 2 + .5);
+            };
+
+            ctx.save();
+            data.labels.forEach((_, i) => {
+              const xPos = x.getPixelForValue(i);
+              const orangeVal = dsOrange.data[i] || 0;
+              const blueVal   = dsBlue.data[i]   || 0;
+              const total     = orangeVal + blueVal;
+
+              const yTopOrange = y.getPixelForValue(orangeVal);
+              if (orangeVal > 0) drawBadge(String(orangeVal), xPos, yTopOrange, 4, 16); // 👈 >1:50
+
+              const yTopTotal = y.getPixelForValue(total);
+              drawBadge(String(total), xPos, yTopTotal, 12, 16); // 👈 TOTAL
+            });
+            ctx.restore();
+          }
+        };
+
+        // ====== Gráfico Ligações Empilhadas ======
+        chartLigacoesHoje = new Chart(
+          document.getElementById("graficoLigacoesHoje").getContext("2d"),
+          {
+            type: "bar",
+            data: {
+              labels: nomesLigHoje,
+              datasets: [
+                { label: '> 1:50', data: longLig,  backgroundColor: 'rgba(255,206,86,0.9)', stack: 'calls' },
+                { label: '≤ 1:50', data: shortLig, backgroundColor: 'rgba(173,216,230,0.9)', stack: 'calls' }
+              ]
+            },
+            options: {
+              ...optionsBase,
+              layout: { padding: { top: 50, bottom: 20 } },
+              scales: {
+                x: { ...optionsBase.scales.x, stacked: true },
+                y: { ...optionsBase.scales.y, stacked: true }
+              },
+              plugins: {
+                ...optionsBase.plugins,
+                datalabels: { display: false },
+                tooltip: {
+                  callbacks: {
+                    label: (ctx) => `${ctx.dataset.label}: ${ctx.formattedValue}`
+                  }
+                }
+              }
+            },
+            plugins: [pluginValores]
+          }
+        );
 
       } catch (e) {
-        console.error("Erro ao carregar dados dos gráficos:", e);
+        console.error("Erro ao carregar gráficos:", e);
       }
     }
 
-    function atualizarTudo() {
-      carregarResumo();
-      carregarGraficosDia();
+    async function iniciar() {
+      fetch("/api/pegar").catch(()=>{});
+      await Promise.all([carregarResumo(), carregarGraficosDia()]);
+      setInterval(async () => {
+        fetch("/api/pegar").catch(()=>{});
+        await Promise.all([carregarResumo(), carregarGraficosDia()]);
+      }, 60000);
     }
-
-    const esperar = ms => new Promise(r => setTimeout(r, ms));
-
-    async function iniciarAtualizacaoAutomatica() {
-      await esperar(2000);
-      await pegarDados();
-      await esperar(1500);
-      atualizarTudo();
-      while (true) {
-        await esperar(60000);
-        await pegarDados();
-        await esperar(1500);
-        atualizarTudo();
-      }
-    }
-
-    iniciarAtualizacaoAutomatica();
+    iniciar();
   </script>
 </body>
 </html>

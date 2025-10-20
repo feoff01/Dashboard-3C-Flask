@@ -1,11 +1,11 @@
-# app.py — Dashboard 3C+ (somente filtro de duração para ligações / sem salvar JSON)
-from flask import Flask, jsonify, send_file, request, Response
+# app.py — Dashboard 3C+ (exclui agente e adiciona gráfico empilhado)
+from flask import Flask, jsonify, send_file, request
 import os, json, re, requests
 from datetime import datetime, timedelta, timezone
 from threading import Thread, Lock
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from collections import defaultdict, Counter
+from collections import defaultdict
 
 app = Flask(__name__)
 
@@ -16,6 +16,9 @@ URL     = f"{BASEURL}/calls"
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 TZ = timezone(timedelta(hours=-3))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
+
+# >>> Agentes a excluir de TODAS as contas <<<
+EXCLUDED_AGENTS = { "Taina Jaremczuk" }
 
 # ===================== HTTP SESSION =====================
 session = requests.Session()
@@ -39,10 +42,10 @@ generation = 0
 # ===================== HELPERS =====================
 def now_local(): return datetime.now(TZ)
 def to_utc_str(dt): return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-def tempo_para_segundos(hms): 
+def tempo_para_segundos(hms):
     try: h, m, s = map(int, (hms or "00:00:00").split(":")); return h*3600+m*60+s
     except: return 0
-def norm(s): return (s or "").strip().lower()
+def norm(s): return (s or "").strip()
 def parse_date(date_str):
     if not date_str: return None
     try:
@@ -51,9 +54,13 @@ def parse_date(date_str):
     except Exception:
         try: return datetime.strptime(date_str[:10], "%Y-%m-%d").replace(tzinfo=TZ)
         except: return None
-def normalize_agent_name(lig): return (lig.get("agent") or lig.get("agent_name") or lig.get("user") or "Desconhecido").strip() or "Desconhecido"
-def is_conversion_strict(lig): return norm(lig.get("qualification")) == "convertido"
+def normalize_agent_name(lig):
+    return (lig.get("agent") or lig.get("agent_name") or lig.get("user") or "Desconhecido").strip() or "Desconhecido"
+def is_conversion_strict(lig): return (lig.get("qualification") or "").strip().lower() == "convertido"
 def rank_stable(items): return sorted(items, key=lambda kv: (-kv[1], kv[0].lower()))
+def is_excluded_agent(name: str) -> bool:
+    return norm(name) in EXCLUDED_AGENTS
+
 def intervalos_anteriores(hoje_date):
     primeiro_mes = hoje_date.replace(day=1)
     ultimo_mes_passado = primeiro_mes - timedelta(days=1)
@@ -105,9 +112,14 @@ def fetch_api_data(start_dt_local, end_dt_local, per_page=500, page_max=500, inc
 
         print(f"[✔] Página {page} carregada com {len(bloco)} registros.")
         for lig in bloco:
+            # Se não incluir todas, pula registros sem agente
             if not incluir_todas:
-                agente = str(lig.get("agent") or "").strip()
-                if not agente or agente == "-": continue
+                agente_raw = str(lig.get("agent") or lig.get("agent_name") or lig.get("user") or "").strip()
+                if not agente_raw or agente_raw == "-":
+                    continue
+                # Exclui agentes bloqueados já na coleta
+                if is_excluded_agent(agente_raw):
+                    continue
             data_all.append(lig)
 
         total_pages += 1
@@ -122,12 +134,14 @@ def fetch_api_data(start_dt_local, end_dt_local, per_page=500, page_max=500, inc
         "to_local": end_dt_local.isoformat(),
         "pages_fetched": total_pages,
         "total_after_filters": len(data_all),
+        "excluded_agents": sorted(EXCLUDED_AGENTS),
     }
     return data_all, meta
 
 # ===================== ROTAS =====================
 @app.route("/")
 def index(): return send_file(os.path.join(os.path.dirname(__file__), "dashboard.html"))
+
 @app.route("/previous")
 def previous(): return send_file(os.path.join(os.path.dirname(__file__), "dashboard_prev.html"))
 
@@ -148,6 +162,7 @@ def status():
 @app.route("/api/pegar")
 def pegar_dados():
     global last_fetch_at, fetch_in_progress, generation
+
     incluir_todas = "raw" in request.args
     force = request.args.get("force") == "1"
 
@@ -214,9 +229,11 @@ def resumo_ligacoes():
         if not dt: continue
         d = dt.date()
         ag = normalize_agent_name(lig)
+        if is_excluded_agent(ag):  # <<< EXCLUIR
+            continue
         dur = tempo_para_segundos(lig.get("speaking_time", "00:00:00"))
 
-        # Ligações semana: apenas > 100s
+        # Ligações semana: apenas > 1s
         if sem_ini <= d <= sem_fim and dur > 1:
             lig_sem_por_ag[ag] += 1
 
@@ -247,7 +264,7 @@ def resumo_ligacoes():
         prev_cache["resumo"] = resposta
     return jsonify(resposta)
 
-# ---- Gráficos com filtro de duração (>100s)
+# ---- Gráficos do DIA (total >1s; subset >110s)
 @app.route("/api/graficos")
 def dados_graficos():
     with cache_lock: dados = list(dados_cache)
@@ -258,34 +275,51 @@ def dados_graficos():
     if anterior and prev_cache["date"] == hoje_str and prev_cache["graficos"]:
         return jsonify(prev_cache["graficos"])
 
-    if anterior:
-        dia = intervalos_anteriores(base)["ontem"][0]
-    else:
-        dia = base
+    dia = intervalos_anteriores(base)["ontem"][0] if anterior else base
 
     conv_por_ag = defaultdict(int)
-    lig_por_ag = defaultdict(int)
+    total_por_ag = defaultdict(int)   # > 1s
+    long_por_ag  = defaultdict(int)   # > 110s (1:50)
 
     for lig in dados:
         dt = parse_date(lig.get("call_date_rfc3339") or lig.get("call_date"))
-        if not dt or dt.date() != dia: continue
+        if not dt or dt.date() != dia: 
+            continue
         ag = normalize_agent_name(lig)
+        if is_excluded_agent(ag):  # <<< EXCLUIR
+            continue
         dur = tempo_para_segundos(lig.get("speaking_time", "00:00:00"))
-        if dur > 1:
-            lig_por_ag[ag] += 1
+
+        if dur > 1:        # total > 1s
+            total_por_ag[ag] += 1
+            if dur > 110:  # subset > 110s
+                long_por_ag[ag] += 1
+
         if is_conversion_strict(lig):
             conv_por_ag[ag] += 1
 
+    # Top 5 por TOTAL (>1s)
+    top_agents = [ag for ag, _ in rank_stable(total_por_ag.items())[:5]]
+    stack = [
+        {
+            "agente": ag,
+            "total": int(total_por_ag.get(ag, 0)),
+            "acima_110": int(long_por_ag.get(ag, 0))
+        }
+        for ag in top_agents
+    ]
+
     resp = {
         "top_vendas_hoje": rank_stable(conv_por_ag.items())[:5],
-        "top_ligacoes_hoje": rank_stable(lig_por_ag.items())[:5],
+        "top_ligacoes_hoje": rank_stable(total_por_ag.items())[:5],   # legado
+        "top_ligacoes_hoje_stack": stack                              # novo
     }
     if anterior:
         prev_cache["date"] = hoje_str
         prev_cache["graficos"] = resp
     return jsonify(resp)
 
-# ---- Auditoria
+# ---- Auditoria de conversões (com exclusão)
 @app.route("/api/audit/conversoes")
 def audit_conversoes():
     with cache_lock: dados = list(dados_cache)
@@ -301,8 +335,12 @@ def audit_conversoes():
     conv_sem, conv_mes = defaultdict(int), defaultdict(int)
     for lig in dados:
         dt = parse_date(lig.get("call_date_rfc3339") or lig.get("call_date"))
-        if not dt or not is_conversion_strict(lig): continue
-        d = dt.date(); ag = normalize_agent_name(lig)
+        if not dt or not is_conversion_strict(lig): 
+            continue
+        ag = normalize_agent_name(lig)
+        if is_excluded_agent(ag):  # <<< EXCLUIR
+            continue
+        d = dt.date()
         if sem_ini <= d <= sem_fim: conv_sem[ag] += 1
         if mes_ini <= d <= mes_fim: conv_mes[ag] += 1
     return jsonify({"semana": rank_stable(conv_sem.items()), "mes": rank_stable(conv_mes.items())})
