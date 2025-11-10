@@ -299,7 +299,7 @@ def dados_graficos():
             conv_por_ag[ag] += 1
 
     # Top 5 por TOTAL (>1s)
-    top_agents = [ag for ag, _ in rank_stable(total_por_ag.items())[:5]]
+    top_agents = [ag for ag, _ in rank_stable(total_por_ag.items())[:10]]
     stack = [
         {
             "agente": ag,
@@ -310,8 +310,8 @@ def dados_graficos():
     ]
 
     resp = {
-        "top_vendas_hoje": rank_stable(conv_por_ag.items())[:5],
-        "top_ligacoes_hoje": rank_stable(total_por_ag.items())[:5],   # legado
+        "top_vendas_hoje": rank_stable(conv_por_ag.items())[:10],
+        "top_ligacoes_hoje": rank_stable(total_por_ag.items())[:10],   # legado
         "top_ligacoes_hoje_stack": stack                              # novo
     }
     if anterior:
