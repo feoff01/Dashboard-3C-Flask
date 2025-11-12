@@ -74,7 +74,7 @@ def intervalos_anteriores(hoje_date):
             "mes_passado": (primeiro_mes_passado, ultimo_mes_passado)}
 
 # ===================== COLETA DA API (com logs) =====================
-def fetch_api_data(start_dt_local, end_dt_local, per_page=500, page_max=500, incluir_todas=False):
+def fetch_api_data(start_dt_local, end_dt_local, per_page=500, page_max=None, incluir_todas=False):
     data_all, page, total_pages = [], 1, 0
     end_dt_local += timedelta(minutes=5)
     params_base = {
@@ -88,9 +88,10 @@ def fetch_api_data(start_dt_local, end_dt_local, per_page=500, page_max=500, inc
     print("==================================\n")
 
     while True:
-        if page > page_max:
+        if page_max is not None and page > page_max:
             print(f"[STOP] Limite de {page_max} páginas atingido.")
             break
+
 
         params = list(params_base.items()) + [("page", page)]
         print(f"[→] Requisitando página {page} ...")
