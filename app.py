@@ -15,7 +15,8 @@ BASEURL = os.getenv("THREEC_BASEURL", "https://barsixp.3c.plus/api/v1")
 URL     = f"{BASEURL}/calls"
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 TZ = timezone(timedelta(hours=-3))
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3000"))  # 50 minutos
+
 
 # >>> Agentes a excluir de TODAS as contas <<<
 EXCLUDED_AGENTS = { "Taina Jaremczuk" }
@@ -74,7 +75,7 @@ def intervalos_anteriores(hoje_date):
             "mes_passado": (primeiro_mes_passado, ultimo_mes_passado)}
 
 # ===================== COLETA DA API (com logs) =====================
-def fetch_api_data(start_dt_local, end_dt_local, per_page=500, page_max=None, incluir_todas=False):
+def fetch_api_data(start_dt_local, end_dt_local, per_page=1000, page_max=None, incluir_todas=False):
     data_all, page, total_pages = [], 1, 0
     end_dt_local += timedelta(minutes=5)
     params_base = {
@@ -171,10 +172,10 @@ def pegar_dados():
         global last_fetch_at, fetch_in_progress, generation
         try:
             fetch_in_progress = True
+
             today = now_local().date()
-            primeiro_mes = today.replace(day=1)
-            ultimo_mes_passado = primeiro_mes - timedelta(days=1)
-            inicio = datetime(ultimo_mes_passado.year, ultimo_mes_passado.month, 1, 0, 0, 0, tzinfo=TZ)
+            # -> Agora pegando do dia 1 deste mês
+            inicio = datetime(today.year, today.month, 1, 0, 0, 0, tzinfo=TZ)
             fim = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=TZ)
 
             dados, meta = fetch_api_data(inicio, fim, incluir_todas=_incluir_todas)
@@ -189,6 +190,7 @@ def pegar_dados():
             print(f"[ERRO em thread de coleta] {e}")
         finally:
             fetch_in_progress = False
+
 
     with cache_lock:
         cached = len(dados_cache) > 0
